@@ -1,0 +1,1 @@
+{"model_name":"sensor_anomaly_detector","version":"1.0.0","framework":"tensorflow","type":"classification","input_shape":[5],"output_shape":[2],"features":["temperature","humidity","pressure","wind_speed","vibration"],"classes":["normal","anomaly"],"accuracy":0.94,"created":"2026-03-19"}
