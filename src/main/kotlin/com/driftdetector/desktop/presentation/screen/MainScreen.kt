@@ -172,26 +172,29 @@ private fun NavigationSidebar(
 
         HorizontalDivider(modifier = Modifier.padding(vertical = 4.dp))
 
-        navItems.forEach { (tab, labelIcon) ->
-            val (label, icon) = labelIcon
-            val isSelected = currentTab == tab
-            val bgColor = if (isSelected) MaterialTheme.colorScheme.primary.copy(alpha = 0.2f) else Color.Transparent
-            Row(
-                modifier = Modifier.fillMaxWidth()
-                    .background(bgColor, RoundedCornerShape(8.dp))
-                    .clickable { onTabSelected(tab) }
-                    .padding(12.dp),
-                verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.spacedBy(12.dp)
-            ) {
-                Icon(icon, label, Modifier.size(20.dp),
-                    tint = if (isSelected) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onPrimaryContainer)
-                Text(label, color = if (isSelected) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onPrimaryContainer,
-                    fontWeight = if (isSelected) FontWeight.Bold else FontWeight.Normal, fontSize = 14.sp)
+        Column(
+            modifier = Modifier.weight(1f).verticalScroll(rememberScrollState()),
+            verticalArrangement = Arrangement.spacedBy(2.dp),
+        ) {
+            navItems.forEach { (tab, labelIcon) ->
+                val (label, icon) = labelIcon
+                val isSelected = currentTab == tab
+                val bgColor = if (isSelected) MaterialTheme.colorScheme.primary.copy(alpha = 0.2f) else Color.Transparent
+                Row(
+                    modifier = Modifier.fillMaxWidth()
+                        .background(bgColor, RoundedCornerShape(8.dp))
+                        .clickable { onTabSelected(tab) }
+                        .padding(12.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(12.dp)
+                ) {
+                    Icon(icon, label, Modifier.size(20.dp),
+                        tint = if (isSelected) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onPrimaryContainer)
+                    Text(label, color = if (isSelected) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onPrimaryContainer,
+                        fontWeight = if (isSelected) FontWeight.Bold else FontWeight.Normal, fontSize = 14.sp)
+                }
             }
         }
-
-        Spacer(Modifier.weight(1f))
 
         // Theme toggle
         Row(
@@ -614,9 +617,105 @@ private fun InstantDriftFixContent(driftViewModel: DriftDetectionViewModel, patc
 @Composable
 private fun AIAssistantContent(aiViewModel: AIAssistantViewModel, driftResults: List<DriftResult>, patches: List<Patch>) {
     val messages by aiViewModel.messages.collectAsState()
+    val runtimeState by aiViewModel.runtimeState.collectAsState()
+    val models by aiViewModel.models.collectAsState()
+    val activeModelId by aiViewModel.activeModelId.collectAsState()
+    val downloadProgress by aiViewModel.downloadProgress.collectAsState()
+    val downloadIssues by aiViewModel.downloadIssues.collectAsState()
+    val isGenerating by aiViewModel.isGenerating.collectAsState()
     var inputText by remember { mutableStateOf("") }
 
     Column(modifier = Modifier.fillMaxSize()) {
+        ElevatedCard(Modifier.fillMaxWidth().padding(bottom = 8.dp)) {
+            Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                Text("Local AI Runtime", fontWeight = FontWeight.SemiBold)
+                Text(runtimeState.statusMessage, fontSize = 13.sp, color = MaterialTheme.colorScheme.outline)
+                Text(
+                    "Available RAM: ${runtimeState.availableMemoryMb} MB | Status: ${if (runtimeState.isReady) "Ready" else if (runtimeState.isInitializing) "Loading" else "Error"}",
+                    fontSize = 12.sp,
+                    color = if (runtimeState.isLowMemory) Color(0xFFB71C1C) else MaterialTheme.colorScheme.outline,
+                )
+                runtimeState.lastError?.let { err ->
+                    Text("Error: $err", fontSize = 12.sp, color = MaterialTheme.colorScheme.error)
+                }
+
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    OutlinedButton(onClick = { aiViewModel.initializeLocalAI() }) {
+                        Text("Initialize Local AI")
+                    }
+                    OutlinedButton(onClick = { aiViewModel.reloadRuntime() }) {
+                        Text("Reload Runtime")
+                    }
+                    OutlinedButton(onClick = { aiViewModel.refreshModels() }) {
+                        Text("Refresh Models")
+                    }
+                    OutlinedButton(onClick = { aiViewModel.unloadModel() }) {
+                        Text("Unload Model")
+                    }
+                    if (isGenerating) {
+                        OutlinedButton(onClick = { aiViewModel.cancelGeneration() }) {
+                            Text("Stop")
+                        }
+                    }
+                }
+
+                if (models.isNotEmpty()) {
+                    Text("Local Models", fontWeight = FontWeight.SemiBold, fontSize = 13.sp)
+                    models.take(4).forEach { model ->
+                        val progress = downloadProgress[model.id] ?: 0f
+                        val isDownloaded = model.isDownloaded
+                        val isLoaded = activeModelId == model.id
+                        val sizeMb = aiViewModel.estimatedModelSizeMb(model.id)
+                        val ramMb = aiViewModel.estimatedModelRamMb(model.id)
+                        val status = when {
+                            isLoaded -> "Loaded"
+                            isDownloaded -> "Downloaded"
+                            progress > 0f && progress < 1f -> "Downloading ${(progress * 100).toInt()}%"
+                            else -> "Not downloaded"
+                        }
+
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(8.dp),
+                        ) {
+                            Column(Modifier.weight(1f)) {
+                                Text(model.name, fontSize = 12.sp, fontWeight = FontWeight.Medium)
+                                Text(status, fontSize = 11.sp, color = MaterialTheme.colorScheme.outline)
+                                if (sizeMb > 0) {
+                                    Text("Size: ${sizeMb}MB | Est. RAM: ${ramMb}MB", fontSize = 10.sp, color = MaterialTheme.colorScheme.outline)
+                                }
+                                downloadIssues[model.id]?.let { issue ->
+                                    Text(issue, fontSize = 10.sp, color = MaterialTheme.colorScheme.error)
+                                }
+                                if (progress > 0f && progress < 1f) {
+                                    LinearProgressIndicator(progress = { progress }, modifier = Modifier.fillMaxWidth())
+                                }
+                            }
+                            if (!isDownloaded) {
+                                OutlinedButton(onClick = { aiViewModel.downloadModel(model.id) }) {
+                                    Text("Download", fontSize = 11.sp)
+                                }
+                            } else if (!isLoaded) {
+                                Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                                    OutlinedButton(onClick = { aiViewModel.loadModel(model.id) }) {
+                                        Text("Load", fontSize = 11.sp)
+                                    }
+                                    OutlinedButton(onClick = { aiViewModel.deleteModel(model.id) }) {
+                                        Text("Delete", fontSize = 11.sp)
+                                    }
+                                }
+                            } else {
+                                OutlinedButton(onClick = { aiViewModel.deleteModel(model.id) }) {
+                                    Text("Delete", fontSize = 11.sp)
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         // Chat messages
         LazyColumn(modifier = Modifier.weight(1f).fillMaxWidth().padding(bottom = 8.dp), reverseLayout = true) {
             items(messages.reversed()) { msg ->
@@ -642,7 +741,7 @@ private fun AIAssistantContent(aiViewModel: AIAssistantViewModel, driftResults: 
 
         // Quick actions
         Row(Modifier.fillMaxWidth().padding(bottom = 8.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-            listOf("/help", "/status", "/drift", "/patches", "/tips").forEach { cmd ->
+            listOf("/help", "/status", "/drift", "/models", "/tips").forEach { cmd ->
                 OutlinedButton(onClick = { aiViewModel.sendMessage(cmd, driftResults, patches) }, contentPadding = PaddingValues(horizontal = 12.dp, vertical = 4.dp)) {
                     Text(cmd, fontSize = 12.sp)
                 }
@@ -653,7 +752,7 @@ private fun AIAssistantContent(aiViewModel: AIAssistantViewModel, driftResults: 
         Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
             OutlinedTextField(
                 value = inputText, onValueChange = { inputText = it },
-                placeholder = { Text("Ask DriftBot anything...") },
+                placeholder = { Text("Ask DriftBot anything (offline)...") },
                 modifier = Modifier.weight(1f), singleLine = true
             )
             Button(onClick = {

@@ -6,6 +6,10 @@ import com.driftdetector.desktop.domain.model.*
 import com.driftdetector.desktop.data.repository.DriftDetectorRepository
 import com.driftdetector.desktop.core.drift.DriftDetector
 import com.driftdetector.desktop.core.data.DataFileParser
+import com.driftdetector.desktop.core.ai.runanywhere.RunAnywhereAIService
+import com.driftdetector.desktop.core.ai.runanywhere.RunAnywhereModelManager
+import com.driftdetector.desktop.core.ai.runanywhere.RunAnywhereRuntime
+import com.driftdetector.desktop.core.ai.runanywhere.RunAnywhereStateStore
 import com.driftdetector.desktop.util.FileUtils
 import java.io.File
 
@@ -407,18 +411,203 @@ class ModelManagementViewModel(repository: DriftDetectorRepository) : BaseViewMo
  * ViewModel for AI Assistant (DriftBot) — Context-Aware (Item #6).
  */
 class AIAssistantViewModel(repository: DriftDetectorRepository) : BaseViewModel(repository) {
-    data class ChatMessage(val text: String, val isUser: Boolean, val timestamp: Long = System.currentTimeMillis())
-
-    private val _messages = MutableStateFlow<List<ChatMessage>>(
-        listOf(ChatMessage("👋 Hello! I'm DriftBot, your AI drift detection assistant. Type /help for commands.", false))
+    data class ChatMessage(
+        val id: String = java.util.UUID.randomUUID().toString(),
+        val text: String,
+        val isUser: Boolean,
+        val timestamp: Long = System.currentTimeMillis(),
+        val isStreaming: Boolean = false,
     )
+
+    private val runtime = RunAnywhereRuntime()
+    private val stateStore = RunAnywhereStateStore()
+    private val modelManager = RunAnywhereModelManager(runtime, stateStore)
+    private val aiService = RunAnywhereAIService(runtime, modelManager)
+    private var streamingJob: Job? = null
+
+    private val _messages = MutableStateFlow(loadInitialMessages())
     val messages = _messages.asStateFlow()
+
+    val runtimeState = runtime.state
+    val models = modelManager.models
+    val activeModelId = modelManager.activeModelId
+    val downloadProgress = modelManager.downloadProgress
+    val downloadIssues = modelManager.downloadIssues
+
+    private val _isGenerating = MutableStateFlow(false)
+    val isGenerating = _isGenerating.asStateFlow()
+
+    init {
+        scope.launch {
+            runtime.initializeIfNeeded()
+            modelManager.refreshCatalog()
+        }
+    }
+
+    private fun loadInitialMessages(): List<ChatMessage> {
+        val persisted = stateStore.load().chatHistory
+        if (persisted.isEmpty()) {
+            return listOf(
+                ChatMessage(
+                    text = "Hello! I am DriftBot running offline with RunAnywhere. Initialize Local AI and load a model to start streaming responses.",
+                    isUser = false,
+                ),
+            )
+        }
+
+        return persisted.takeLast(50).map {
+            ChatMessage(text = it.text, isUser = it.isUser, timestamp = it.timestamp)
+        }
+    }
+
+    private fun persistChatHistory() {
+        val state = stateStore.load()
+        state.chatHistory = _messages.value.takeLast(80).map { msg ->
+            RunAnywhereStateStore.ChatRecord(
+                text = msg.text,
+                isUser = msg.isUser,
+                timestamp = msg.timestamp,
+            )
+        }
+        stateStore.save(state)
+    }
+
+    fun initializeLocalAI() {
+        scope.launch {
+            runtime.initializeIfNeeded()
+            modelManager.refreshCatalog()
+        }
+    }
+
+    fun refreshModels() {
+        scope.launch { modelManager.refreshCatalog() }
+    }
+
+    fun downloadModel(modelId: String) {
+        modelManager.downloadModel(scope, modelId) { error -> setError(error) }
+    }
+
+    fun loadModel(modelId: String) {
+        scope.launch {
+            modelManager.loadModel(modelId)
+                .onSuccess { setSuccess("Model loaded: $modelId") }
+                .onFailure { setError("Failed to load model: ${it.message}") }
+        }
+    }
+
+    fun unloadModel() {
+        scope.launch {
+            modelManager.unloadModel()
+                .onSuccess { setSuccess("Model unloaded") }
+                .onFailure { setError("Failed to unload model: ${it.message}") }
+        }
+    }
+
+    fun deleteModel(modelId: String) {
+        scope.launch {
+            modelManager.deleteModel(modelId)
+                .onSuccess { setSuccess("Model deleted: $modelId") }
+                .onFailure { setError("Failed to delete model: ${it.message}") }
+        }
+    }
+
+    fun reloadRuntime() {
+        scope.launch {
+            val ok = runtime.reload()
+            if (ok) {
+                modelManager.refreshCatalog()
+                setSuccess("Runtime reloaded")
+            } else {
+                setError(runtimeState.value.lastError ?: "Failed to reload runtime")
+            }
+        }
+    }
+
+    fun estimatedModelSizeMb(modelId: String): Int =
+        modelManager.getCatalogSpec(modelId)?.approxSizeMb ?: 0
+
+    fun estimatedModelRamMb(modelId: String): Int {
+        val size = estimatedModelSizeMb(modelId)
+        if (size == 0) return 0
+        return (size * 1.3).toInt()
+    }
+
+    fun cancelGeneration() {
+        streamingJob?.cancel()
+        aiService.cancelGeneration()
+        _isGenerating.value = false
+    }
 
     fun sendMessage(text: String, driftResults: List<DriftResult> = emptyList(), patches: List<Patch> = emptyList()) {
         if (text.isBlank()) return
-        _messages.value = _messages.value + ChatMessage(text, true)
-        val response = processMessage(text, driftResults, patches)
-        _messages.value = _messages.value + ChatMessage(response, false)
+        val trimmed = text.trim()
+        _messages.value = _messages.value + ChatMessage(text = trimmed, isUser = true)
+        persistChatHistory()
+
+        if (trimmed.startsWith("/")) {
+            val response = processMessage(trimmed, driftResults, patches)
+            _messages.value = _messages.value + ChatMessage(text = response, isUser = false)
+            return
+        }
+
+        streamingJob?.cancel()
+        val assistantMessageId = java.util.UUID.randomUUID().toString()
+        _messages.value = _messages.value + ChatMessage(id = assistantMessageId, text = "", isUser = false, isStreaming = true)
+
+        streamingJob = scope.launch {
+            _isGenerating.value = true
+            try {
+                val tokenBuffer = StringBuilder()
+                var lastFlush = 0L
+
+                val promptType = when {
+                    trimmed.contains("summary", ignoreCase = true) || trimmed.contains("summarize", ignoreCase = true) -> RunAnywhereAIService.PromptType.SUMMARY
+                    trimmed.contains("fix", ignoreCase = true) || trimmed.contains("mitigate", ignoreCase = true) || trimmed.contains("recommend", ignoreCase = true) -> RunAnywhereAIService.PromptType.FIX_SUGGESTION
+                    trimmed.contains("why", ignoreCase = true) || trimmed.contains("explain", ignoreCase = true) -> RunAnywhereAIService.PromptType.DRIFT_EXPLANATION
+                    else -> RunAnywhereAIService.PromptType.GENERAL
+                }
+
+                aiService.streamAssistantReply(trimmed, driftResults, patches, promptType = promptType).collect { token ->
+                    tokenBuffer.append(token)
+                    val now = System.currentTimeMillis()
+                    if (now - lastFlush >= 50L || token.endsWith("\n")) {
+                        appendAssistantToken(assistantMessageId, tokenBuffer.toString())
+                        tokenBuffer.clear()
+                        lastFlush = now
+                    }
+                }
+
+                if (tokenBuffer.isNotEmpty()) {
+                    appendAssistantToken(assistantMessageId, tokenBuffer.toString())
+                }
+            } catch (t: Throwable) {
+                appendAssistantToken(
+                    assistantMessageId,
+                    "\n\n[Local generation error: ${t.message ?: "unknown error"}]",
+                )
+            } finally {
+                finalizeAssistantMessage(assistantMessageId)
+                persistChatHistory()
+                _isGenerating.value = false
+            }
+        }
+    }
+
+    private fun appendAssistantToken(messageId: String, token: String) {
+        _messages.value = _messages.value.map { msg ->
+            if (msg.id == messageId) msg.copy(text = msg.text + token, isStreaming = true) else msg
+        }
+    }
+
+    private fun finalizeAssistantMessage(messageId: String) {
+        _messages.value = _messages.value.map { msg ->
+            if (msg.id == messageId) {
+                val finalText = if (msg.text.isBlank()) "No output generated." else msg.text
+                msg.copy(text = finalText, isStreaming = false)
+            } else {
+                msg
+            }
+        }
     }
 
     private fun processMessage(text: String, driftResults: List<DriftResult>, patches: List<Patch>): String {
@@ -433,6 +622,7 @@ class AIAssistantViewModel(repository: DriftDetectorRepository) : BaseViewModel(
                 • `/patches` — List patches with recommendations
                 • `/impact` — Feature impact ranking
                 • `/recommend` — Smart recommendation based on current state
+                • `/models` — Local model status
                 • `/tips` — Drift detection tips
                 • `/about` — About DriftGuardAI
             """.trimIndent()
@@ -441,7 +631,25 @@ class AIAssistantViewModel(repository: DriftDetectorRepository) : BaseViewModel(
                 val driftCount = driftResults.size
                 val patchCount = patches.size
                 val applied = patches.count { it.status == "APPLIED" }
-                "📊 **System Status:**\n• Drift analyses: $driftCount\n• Patches: $patchCount ($applied applied)\n• Engine: Local (Desktop)\n• Status: ✅ Ready"
+                val runtimeStatus = runtime.state.value.statusMessage
+                val modelStatus = activeModelId.value ?: "none"
+                "📊 **System Status:**\n• Drift analyses: $driftCount\n• Patches: $patchCount ($applied applied)\n• Engine: RunAnywhere Local\n• Runtime: $runtimeStatus\n• Active model: $modelStatus"
+            }
+
+            cmd == "/models" -> {
+                val localModels = models.value
+                if (localModels.isEmpty()) {
+                    "No models registered yet. Click Refresh Models in the AI Assistant tab."
+                } else {
+                    "🧠 **Local Models:**\n" + localModels.joinToString("\n") {
+                        val state = when {
+                            activeModelId.value == it.id -> "LOADED"
+                            it.isDownloaded -> "DOWNLOADED"
+                            else -> "REGISTERED"
+                        }
+                        "• ${it.name} (${it.id}) [$state]"
+                    }
+                }
             }
 
             cmd == "/drift" -> {
@@ -491,7 +699,7 @@ class AIAssistantViewModel(repository: DriftDetectorRepository) : BaseViewModel(
                 • Use the Simulation tab to test different drift scenarios
             """.trimIndent()
 
-            cmd == "/about" -> "🛡️ **DriftGuardAI Desktop v2.0.0**\nML Model Drift Detection, Auto-Patching & Self-Healing System\nBuilt with Kotlin + Compose Multiplatform"
+            cmd == "/about" -> "🛡️ **DriftGuardAI Desktop v2.0.0**\nML Drift Detection, Auto-Patching, and Offline AI Assistant\nBuilt with Kotlin + Compose + RunAnywhere"
 
             // Context-aware responses (Item #6)
             cmd.contains("why") && latest != null -> {
@@ -521,7 +729,7 @@ class AIAssistantViewModel(repository: DriftDetectorRepository) : BaseViewModel(
             cmd.contains("psi") -> "PSI (Population Stability Index) measures distribution shift. Values > 0.25 = significant, > 0.10 = slight, < 0.10 = stable."
             cmd.contains("ks") -> "KS Test (Kolmogorov-Smirnov) is a non-parametric test comparing two distributions. Low p-value = significant difference."
 
-            else -> "I can help with drift detection questions! Try `/help` for commands, `/recommend` for smart suggestions, or ask about drift, patches, PSI, or KS tests."
+            else -> "I can help with drift detection questions. Try /help for commands, /models for local model state, or ask about drift, patches, PSI, and KS tests."
         }
     }
 }

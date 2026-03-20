@@ -46,7 +46,7 @@ dependencies {
     
     // File handling
     implementation("commons-io:commons-io:2.13.0")
-    
+
     // Testing
     testImplementation(kotlin("test"))
     testImplementation("io.ktor:ktor-client-mock:2.3.4")
